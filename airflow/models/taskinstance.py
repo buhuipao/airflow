@@ -1259,7 +1259,13 @@ def _handle_failure(
     if not test_mode:
         TaskInstance.save_to_db(task_instance, session)
 
-    with Trace.start_span_from_taskinstance(ti=task_instance) as span:
+    # Emit a child span under the TaskInstance root span when handling failure
+    with Trace.start_span_from_taskinstance(
+        span_name="handle_failure",
+        component="taskinstance",
+        ti=task_instance,
+        child=True,
+    ) as span:
         # ---- error info ----
         span.set_attribute("error", "true")
         span.set_attribute("error_msg", str(error))

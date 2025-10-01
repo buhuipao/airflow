@@ -364,3 +364,85 @@ def test_celery_task_acks_late_loaded_from_string():
     # reload celery conf to apply the new config
     importlib.reload(default_celery)
     assert default_celery.DEFAULT_CELERY_CONFIG["task_acks_late"] is False
+
+
+def _make_task_tuple(dag_id: str, task_id: str, try_number: int = 1):
+    key = TaskInstanceKey(dag_id, task_id, f"{dag_id}_{try_number}", try_number)
+    command = ["airflow", "tasks", "run", dag_id, task_id]
+    queue = "default"
+    task = object()
+    extra_ctx = None
+    return key, command, queue, task, extra_ctx
+
+
+def test_publish_tasks_in_threads_success():
+    tuples = [_make_task_tuple("dag_a", "task_a", 1), _make_task_tuple("dag_b", "task_b", 2)]
+
+    def fake_send(task_tuple):
+        key, command, *_ = task_tuple
+        return key, command, "RESULT"
+
+    with mock.patch(
+        "airflow.providers.celery.executors.celery_executor_utils.send_task_to_executor",
+        side_effect=fake_send,
+    ):
+        results = celery_executor_utils.publish_tasks_in_threads(tuples, max_workers=2, operation_timeout=5)
+
+    assert len(results) == 2
+    for (exp_key, exp_cmd, *_), (key, cmd, result) in zip(tuples, results):
+        assert key == exp_key
+        assert cmd == exp_cmd
+        assert result == "RESULT"
+
+
+def test_publish_tasks_in_threads_exception():
+    tuples = [_make_task_tuple("dag_c", "task_c", 3)]
+
+    with mock.patch(
+        "airflow.providers.celery.executors.celery_executor_utils.send_task_to_executor",
+        side_effect=RuntimeError("boom"),
+    ):
+        results = celery_executor_utils.publish_tasks_in_threads(tuples, max_workers=1, operation_timeout=5)
+
+    assert len(results) == 1
+    key, cmd, result = results[0]
+    assert key == tuples[0][0]
+    assert cmd == tuples[0][1]
+    assert isinstance(result, celery_executor_utils.ExceptionWithTraceback)
+    assert str(result.exception) == "Failed to send to executor"
+    assert "RuntimeError: boom" in result.traceback
+
+
+def test_publish_tasks_in_threads_empty_and_zero_workers():
+    # Empty inputs return empty results
+    assert celery_executor_utils.publish_tasks_in_threads([], max_workers=4) == []
+
+    # Zero workers short-circuits and returns no results
+    tuples = [_make_task_tuple("dag_d", "task_d", 1)]
+    assert celery_executor_utils.publish_tasks_in_threads(tuples, max_workers=0) == []
+
+
+def test_publish_tasks_in_threads_timeout():
+    tuples = [_make_task_tuple("dag_e", "task_e", 1)]
+
+    def slow_send(_):
+        import time
+
+        time.sleep(0.2)
+        return "should_not_happen"
+
+    with mock.patch(
+        "airflow.providers.celery.executors.celery_executor_utils.send_task_to_executor",
+        side_effect=slow_send,
+    ):
+        results = celery_executor_utils.publish_tasks_in_threads(
+            tuples, max_workers=1, operation_timeout=0.01
+        )
+
+    assert len(results) == 1
+    key, cmd, result = results[0]
+    assert key == tuples[0][0]
+    assert cmd == tuples[0][1]
+    assert isinstance(result, celery_executor_utils.ExceptionWithTraceback)
+    assert isinstance(result.exception, celery_executor_utils.AirflowTaskTimeout)
+    assert "Celery publish timed out after 0.01 seconds" in str(result.exception)

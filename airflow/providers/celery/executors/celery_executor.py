@@ -30,7 +30,6 @@ import math
 import operator
 import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import cpu_count
 from typing import TYPE_CHECKING, Any, Optional, Sequence, Tuple
 
@@ -55,6 +54,8 @@ from airflow.configuration import conf
 from airflow.exceptions import AirflowTaskTimeout
 from airflow.executors.base_executor import BaseExecutor
 from airflow.stats import Stats
+from airflow.traces.tracer import span
+from airflow.traces.utils import gen_span_id, gen_trace_id
 from airflow.utils.state import TaskInstanceState
 
 log = logging.getLogger(__name__)
@@ -73,8 +74,8 @@ if TYPE_CHECKING:
     from airflow.models.taskinstancekey import TaskInstanceKey
 
     # Task instance that is sent over Celery queues
-    # TaskInstanceKey, Command, queue_name, CallableTask
-    TaskInstanceInCelery = Tuple[TaskInstanceKey, CommandType, Optional[str], Task]
+    # TaskInstanceKey, Command, queue_name, CallableTask, extra_ctx
+    TaskInstanceInCelery = Tuple[TaskInstanceKey, CommandType, Optional[str], Task, Optional[dict[Any, Any]]]
 
 
 # PEP562
@@ -256,10 +257,24 @@ class CeleryExecutor(BaseExecutor):
         """
         return max(1, math.ceil(to_send_count / self._sync_parallelism))
 
+    @span
     def _process_tasks(self, task_tuples: list[TaskTuple]) -> None:
         from airflow.providers.celery.executors.celery_executor_utils import execute_command
 
-        task_tuples_to_send = [task_tuple[:3] + (execute_command,) for task_tuple in task_tuples]
+        task_tuples_to_send = []
+        for key, command, queue, _ in task_tuples:
+            ti = self.queued_tasks[key][3]
+            parent_trace_id = int(gen_trace_id(ti.dag_run, as_int=True))
+            # Use the same span id generator as task_instance spans to guarantee
+            # parent-child linkage regardless of try_number representation.
+            parent_span_id = int(gen_span_id(ti, as_int=True))
+            extra_ctx: dict[Any, Any] | None = {
+                "parent_trace_id": parent_trace_id,
+                "parent_span_id": parent_span_id,
+            }
+            # Enrich task tuples with trace context (TI trace_id/span_id) so producer
+            # and worker spans can be correctly parented under task_instance.
+            task_tuples_to_send.append((key, command, queue, execute_command, extra_ctx))
         first_task = next(t[3] for t in task_tuples_to_send)
 
         # Celery state queries will stuck if we do not use one same backend
@@ -310,16 +325,12 @@ class CeleryExecutor(BaseExecutor):
             # One tuple, or max one process -> send it in the main thread.
             return list(map(send_task_to_executor, task_tuples_to_send))
 
-        # Use chunks instead of a work queue to reduce context switching
-        # since tasks are roughly uniform in size
-        chunksize = self._num_tasks_per_send_process(len(task_tuples_to_send))
-        num_processes = min(len(task_tuples_to_send), self._sync_parallelism)
+        # Delegate to shared util that enforces timeout per publish
+        from airflow.providers.celery.executors.celery_executor_utils import (
+            publish_tasks_in_threads,
+        )
 
-        with ProcessPoolExecutor(max_workers=num_processes) as send_pool:
-            key_and_async_results = list(
-                send_pool.map(send_task_to_executor, task_tuples_to_send, chunksize=chunksize)
-            )
-        return key_and_async_results
+        return publish_tasks_in_threads(task_tuples_to_send, self._sync_parallelism)
 
     def sync(self) -> None:
         if not self.tasks:

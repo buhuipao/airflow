@@ -29,7 +29,7 @@ import os
 import subprocess
 import traceback
 import warnings
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, TimeoutError
 from typing import TYPE_CHECKING, Any, Mapping, MutableMapping, Optional, Tuple
 
 from celery import Celery, Task, states as celery_states
@@ -59,7 +59,9 @@ if TYPE_CHECKING:
     from airflow.executors.base_executor import CommandType, EventBufferValueType
     from airflow.models.taskinstance import TaskInstanceKey
 
-    TaskInstanceInCelery = Tuple[TaskInstanceKey, CommandType, Optional[str], Task]
+    # Task sent over Celery queues. The 5th element carries optional trace context
+    # to parent producer/worker spans under the TaskInstance span.
+    TaskInstanceInCelery = Tuple[TaskInstanceKey, CommandType, Optional[str], Task, Optional[dict]]
 
 OPERATION_TIMEOUT = conf.getfloat("celery", "operation_timeout")
 
@@ -210,17 +212,104 @@ class ExceptionWithTraceback:
         self.traceback = exception_traceback
 
 
+def publish_tasks_in_threads(
+    task_tuples_to_send: list[TaskInstanceInCelery],
+    max_workers: int,
+    operation_timeout: float = OPERATION_TIMEOUT,
+) -> list[tuple[TaskInstanceKey, CommandType, AsyncResult | ExceptionWithTraceback]]:
+    """
+    Publish tasks concurrently using a thread pool.
+
+    This runs `send_task_to_executor` in worker threads and waits for each future
+    with timeout. On timeout or exception, returns an ExceptionWithTraceback
+    so the caller can handle retries/failures uniformly.
+    """
+    num_threads = min(len(task_tuples_to_send), max_workers)
+    results: list[tuple[TaskInstanceKey, CommandType, AsyncResult | ExceptionWithTraceback]] = []
+    if num_threads <= 0:
+        return results
+
+    with ThreadPoolExecutor(max_workers=num_threads) as send_pool:
+        future_to_tuple = {
+            send_pool.submit(send_task_to_executor, task_tuple): task_tuple
+            for task_tuple in task_tuples_to_send
+        }
+
+        for future, task_tuple in future_to_tuple.items():
+            key, command, *_ = task_tuple
+            try:
+                results.append(future.result(timeout=operation_timeout))
+            except TimeoutError:
+                future.cancel()
+                exception_traceback = (
+                    f"Celery Task ID: {key}\nTimeout while publishing task after"
+                    f" {operation_timeout} seconds."
+                )
+                results.append(
+                    (
+                        key,
+                        command,
+                        ExceptionWithTraceback(
+                            AirflowTaskTimeout(f"Celery publish timed out after {operation_timeout} seconds"),
+                            exception_traceback,
+                        ),
+                    )
+                )
+            except Exception:
+                future.cancel()
+                exception_traceback = f"Celery Task ID: {key}\n{traceback.format_exc()}"
+                results.append(
+                    (
+                        key,
+                        command,
+                        ExceptionWithTraceback(Exception("Failed to send to executor"), exception_traceback),
+                    )
+                )
+
+    return results
+
+
 def send_task_to_executor(
     task_tuple: TaskInstanceInCelery,
 ) -> tuple[TaskInstanceKey, CommandType, AsyncResult | ExceptionWithTraceback]:
-    """Send task to executor."""
-    key, command, queue, task_to_run = task_tuple
-    try:
-        with timeout(seconds=OPERATION_TIMEOUT):
+    """
+    Send task to executor with parent trace context.
+
+    The tuple contains a 5th element `extra_ctx` with:
+    - parent_trace_id: int
+    - parent_span_id: int
+    """
+    # Start a producer-side span parented under the TaskInstance span.
+    from opentelemetry.trace.span import INVALID_SPAN_ID, INVALID_TRACE_ID
+
+    from airflow.traces.tracer import Trace, gen_context
+
+    key, command, queue, task_to_run, extra_ctx = task_tuple  # type: ignore[misc]
+    parent_trace_id = int(extra_ctx["parent_trace_id"]) if extra_ctx else INVALID_TRACE_ID
+    parent_span_id = int(extra_ctx["parent_span_id"]) if extra_ctx else INVALID_SPAN_ID
+    parent_sc = gen_context(trace_id=parent_trace_id, span_id=parent_span_id)
+    with Trace.start_span(
+        span_name="send_task_to_executor",
+        component="CeleryExecutor",
+        parent_sc=parent_sc,
+    ) as span:
+        span.set_attribute("dag_id", key.dag_id)
+        span.set_attribute("run_id", key.run_id)
+        span.set_attribute("task_id", key.task_id)
+        span.set_attribute("try_number", key.try_number)
+        span.set_attribute("command", str(command))
+        span.set_attribute("queue", str(queue))
+        span.set_attribute("executor_config", str(extra_ctx))
+        span.set_attribute("parent_trace_id", str(parent_trace_id))
+        span.set_attribute("parent_span_id", str(parent_span_id))
+        try:
+            # If the user has installed the Celery OTel instrument, it will
+            # automatically inject headers from the current context;
+            # otherwise, call directly
             result = task_to_run.apply_async(args=[command], queue=queue)
-    except (Exception, AirflowTaskTimeout) as e:
-        exception_traceback = f"Celery Task ID: {key}\n{traceback.format_exc()}"
-        result = ExceptionWithTraceback(e, exception_traceback)
+        except Exception as e:
+            exception_traceback = f"Celery Task ID: {key}\n{traceback.format_exc()}"
+            result = ExceptionWithTraceback(e, exception_traceback)
 
     return key, command, result
 

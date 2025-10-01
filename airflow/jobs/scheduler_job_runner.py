@@ -647,6 +647,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
 
             # set TIs to queued state
             filter_for_tis = TI.filter_for_tis(executable_tis)
+            queued_now = timezone.utcnow()
             session.execute(
                 update(TI)
                 .where(filter_for_tis)
@@ -654,14 +655,31 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     # TODO[ha]: should we use func.now()? How does that work with DB timezone
                     # on mysql when it's not UTC?
                     state=TaskInstanceState.QUEUED,
-                    queued_dttm=timezone.utcnow(),
+                    queued_dttm=queued_now,
                     queued_by_job_id=self.job.id,
                 )
                 .execution_options(synchronize_session=False)
             )
 
+            # Synchronize in-memory objects with queued timestamp for tracing start times
             for ti in executable_tis:
+                ti.queued_dttm = queued_now
                 ti.emit_state_change_metric(TaskInstanceState.QUEUED)
+
+            # Emit a root TaskInstance span at scheduling time (QUEUED)
+            for ti in executable_tis:
+                try:
+                    with Trace.start_span_from_taskinstance(ti=ti, component="scheduler") as span:
+                        span.set_attribute("task_id", ti.task_id)
+                        span.set_attribute("dag_id", ti.dag_id)
+                        span.set_attribute("state", TaskInstanceState.QUEUED)
+                        span.set_attribute("try_number", ti.try_number)
+                        span.set_attribute("queued_dttm", str(ti.queued_dttm))
+                        span.set_attribute("queue", ti.queue)
+                        span.set_attribute("priority_weight", ti.priority_weight)
+                except Exception:
+                    # Tracing should be non-fatal to scheduling
+                    self.log.debug("Tracing span emit failed for %s at QUEUED", ti, exc_info=True)
 
         for ti in executable_tis:
             make_transient(ti)
@@ -834,7 +852,13 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 ti.pid,
             )
 
-            with Trace.start_span_from_taskinstance(ti=ti) as span:
+            # Emit a child span under the TaskInstance root span for terminal events
+            with Trace.start_span_from_taskinstance(
+                span_name="update_state",
+                component="scheduler",
+                ti=ti,
+                child=True,
+            ) as span:
                 span.set_attribute("category", "scheduler")
                 span.set_attribute("task_id", ti.task_id)
                 span.set_attribute("dag_id", ti.dag_id)
@@ -1551,8 +1575,28 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
             __span.set_attribute("type", dag_run.run_type)
             __span.set_attribute("dag_id", dag_run.dag_id)
 
+            prev_state = dag_run.state
             dag_run.state = DagRunState.RUNNING
             dag_run.start_date = timezone.utcnow()
+            # Transition to RUNNING and create the DagRun root span once here
+            if prev_state != DagRunState.RUNNING:
+                with Trace.start_span_from_dagrun(component="scheduler", dagrun=dag_run) as dr_span:
+                    attrs = {
+                        "category": "DAG runs",
+                        "dag_id": str(dag_run.dag_id),
+                        "execution_date": str(dag_run.execution_date),
+                        "run_id": str(dag_run.run_id),
+                        "queued_at": str(dag_run.queued_at),
+                        "run_start_date": str(dag_run.start_date),
+                        "state": str(dag_run.state),
+                        "external_trigger": str(dag_run.external_trigger),
+                        "run_type": str(dag_run.run_type),
+                        "data_interval_start": str(dag_run.data_interval_start),
+                        "data_interval_end": str(dag_run.data_interval_end),
+                        "dag_hash": str(dag_run.dag_hash),
+                        "conf": str(dag_run.conf),
+                    }
+                    dr_span.set_attributes(attrs)
             if dag.timetable.periodic and not dag_run.external_trigger and dag_run.clear_number < 1:
                 # TODO: Logically, this should be DagRunInfo.run_after, but the
                 # information is not stored on a DagRun, only before the actual
